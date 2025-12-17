@@ -1,0 +1,2 @@
+ultralytics==8.3.239
+Flask== 3.1.2
