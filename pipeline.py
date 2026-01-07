@@ -4,7 +4,7 @@ import cv2
 from app.retail_analytics import RetailAnalytics
 import threading
 import time
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+import os
 
 class Prediction:
     def __init__(self, MODEL_PATH, VIDEO_PATH, confidence=0.7):
@@ -22,6 +22,8 @@ class Prediction:
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.suspicious=False
         self.frame= None
+        self.out = None
+        self.temp_video_path = None
 
 
     def capture_video(self, reconnect_attempts=3, reconnect_delay=2.0):
@@ -48,28 +50,30 @@ class Prediction:
     def start_prediction(self):
         with self._lock:
             if self.running:
-                print("Prediction already running")
                 return
             self.running = True
 
-        if not self.capture_video(reconnect_attempts=2, reconnect_delay=1.0):
-            print("Unable to open video source - exiting prediction loop")
-            with self._lock:
-                self.running = False
+        if not self.capture_video():
+            self.running = False
             return
-        while True:
+
+        # TEMP FILE (always recording)
+        self.temp_video_path = "temp_recording.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        self.out = cv2.VideoWriter(
+            self.temp_video_path,
+            fourcc,
+            self.fps,
+            (self.width, self.height)
+        )
+
+        while self.running:
             self.frame, meta = preprocess_frame(self.cap, self.fps)
             if self.frame is None:
                 break
-
-            frame_count = meta["frame_count"]
-            current_time = meta["current_time"]
-
+            current_time=meta["current_time"]
             detections = predict_frame(self.model, self.frame)
             events = analytics_step(self.analytics, detections, current_time)
-
-            debug_step(frame_count, self.total_frames, detections, self.analytics)
-
             render_frame(
                 self.frame,
                 detections,
@@ -79,9 +83,16 @@ class Prediction:
                 self.width,
                 self.height
             )
+
+            # ALWAYS RECORD
+            self.out.write(self.frame)
+
         self.cap.release()
+        if self.out is not None:
+            self.out.release()
     def save_video(self,OUTPUT_PATH):
-        out = cv2.VideoWriter(fourcc, self.fps, (self.width, self.height))
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # codec
+        out = cv2.VideoWriter(OUTPUT_PATH, fourcc, self.fps, (self.width, self.height))
         out.write(self.frame)
         out.release()
 
@@ -133,8 +144,22 @@ class Prediction:
 
         return output, developer_message
 
-    def stop_prediction(self,path="A100200"):
+
+    def stop_prediction(self, path):
+        # Signal the loop to stop
+        self.running = False
+
+        # CRITICAL: wait for VideoWriter.release()
+        if self.thread and self.thread.is_alive():
+            self.thread.join()
+
+        # Now the file is unlocked
         if self.suspicious:
-            self.save_video(self.frame,path)
+            final_path = f"{path}.mp4"
+            os.replace("temp_recording.mp4", final_path)
             return True
+
+        if os.path.exists("temp_recording.mp4"):
+            os.remove("temp_recording.mp4")
+
         return False

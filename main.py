@@ -15,6 +15,7 @@ def start_prediction():
             return jsonify({"message": "Prediction already running"}), 400
 
         prediction_thread = threading.Thread(target=model.start_prediction)
+        model.thread = prediction_thread
         prediction_thread.start()
         return jsonify({"message": "Prediction started"}), 200
 
