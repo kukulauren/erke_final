@@ -58,7 +58,7 @@ class Prediction:
             return
 
         # TEMP FILE (always recording)
-        self.temp_video_path = "temp_recording.mp4"
+        self.temp_video_path = r"E:\IGS_record\temp_recording.mp4"
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         self.out = cv2.VideoWriter(
             self.temp_video_path,
@@ -146,20 +146,20 @@ class Prediction:
         return output, developer_message
 
     def stop_prediction(self, path):
-        # Signal the loop to stop
         self.running = False
 
-        # CRITICAL: wait for VideoWriter.release()
         if self.thread and self.thread.is_alive():
             self.thread.join()
 
-        # Now the file is unlocked
+        if not os.path.exists(self.temp_video_path):
+            raise FileNotFoundError(
+                f"Temp recording not found: {self.temp_video_path}"
+            )
+
         if self.suspicious:
             final_path = f"{path}.mp4"
-            os.replace("temp_recording.mp4", final_path)
+            os.replace(self.temp_video_path, final_path)
             return True
 
-        if os.path.exists("temp_recording.mp4"):
-            os.remove("temp_recording.mp4")
-
+        os.remove(self.temp_video_path)
         return False
