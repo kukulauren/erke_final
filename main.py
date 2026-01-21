@@ -37,7 +37,7 @@ def stop_prediction():
         if not voucher_number or not cashier_id:
             return jsonify({"error": "voucher_number and cashier_id are required"}), 400
         output,developer_message=model.print_output(pos_wallet, pos_member)
-        video_saved=model.stop_prediction(path=f"{voucher_number}_{cashier_id}")
+        video_saved = model.stop_prediction(path=rf"E:\IGS_record\{voucher_number}_{cashier_id}")
         return jsonify({
             "prediction_summary": output,
             "recording_saved": video_saved

@@ -95,15 +95,19 @@ class Prediction:
         out = cv2.VideoWriter(OUTPUT_PATH, fourcc, self.fps, (self.width, self.height))
         out.write(self.frame)
         out.release()
-
-    def print_output(self,pos_wallet: bool = False,pos_member: bool = False) -> tuple[dict, dict]:
+    
+    def print_output(self, pos_wallet: bool = False, pos_member: bool = False) -> tuple[dict, dict]:
 
         output = {
             "items_scanned": True,
             "cashier": True,
             "scanner_moving": True,
             "pos_member": pos_member,
-            "suspicious_activity":False
+            "suspicious_activity": False,
+            "customer_paid_wallet": False,
+            "customer_paid_cash": False,
+            "purchasing_customer": False,
+            "member_use": False
         }
 
         developer_message = {}
@@ -111,39 +115,35 @@ class Prediction:
 
         has_customer = bool(self.analytics.customer_visits)
         has_cash = bool(self.analytics.cash_detected)
-        has_phone = len(self.analytics.completed_payments) > 0  # member scan
+        has_member_scan = len(self.analytics.completed_payments) > 0
 
         # WALLET PAYMENT (POS CONFIRMED – SHORT CIRCUIT)
         if pos_wallet:
-            output["customer_paid_wallet"] = True
-            output["purchasing_customer"] = True
-            output["member_use"] = pos_member
+            output.update({
+                "customer_paid_wallet": True,
+                "purchasing_customer": True,
+                "member_use": pos_member
+            })
             return output, developer_message
 
         # CASH + MEMBER DETECTION
         output["customer_paid_cash"] = has_cash
 
-        if has_customer and has_cash and has_phone:
-            # ✅ PERFECT CASE
+        if has_customer and has_cash and has_member_scan:
             output["purchasing_customer"] = True
             output["member_use"] = True
-
         else:
-            # Something missing
             output["suspicious_activity"] = True
             self.suspicious = True
 
             if not has_customer:
                 developer_message["customer_detection"] = "POSC1-MODELC0"
-
             if not has_cash:
                 developer_message["cash_detection"] = "POSB1-MODELB0"
-
-            if not has_phone:
+            if not has_member_scan:
                 developer_message["member_detection"] = "POSM1-MODELM0"
 
         return output, developer_message
-
 
     def stop_prediction(self, path):
         # Signal the loop to stop
