@@ -29,15 +29,14 @@ def stop_prediction():
         pos_member = data.get("pos_member")
         pos_wallet = data.get("pos_wallet")
         voucher_number = data.get("voucher_number")
-        cashier_id = data.get("cashier_id")
 
         if not isinstance(pos_member, bool) or not isinstance(pos_wallet, bool):
             return jsonify({"error": "pos_member and pos_wallet must be boolean"}), 400
 
-        if not voucher_number or not cashier_id:
-            return jsonify({"error": "voucher_number and cashier_id are required"}), 400
+        if not voucher_number:
+            return jsonify({"error": "voucher_number is required"}), 400
         output,developer_message=model.print_output(pos_wallet, pos_member)
-        video_saved = model.stop_prediction(path=rf"E:\IGS_record\{voucher_number}_{cashier_id}")
+        video_saved = model.stop_prediction(path=rf"E:\IGS_record\{voucher_number}")
         return jsonify({
             "prediction_summary": output,
             "recording_saved": video_saved
