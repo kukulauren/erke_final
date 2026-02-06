@@ -39,12 +39,14 @@ def get_box_iou(box1, box2):
 
     return intersection / union if union > 0 else 0
 
-def preprocess_frame(cap, fps,frame_count=0 ):
+def preprocess_frame(cap, fps):
+    """Extract frame from video and calculate metadata"""
     ret, frame = cap.read()
     if not ret:
         return None, None
 
-    frame_count += 1
+    # Get frame position automatically from video capture
+    frame_count = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
     current_time = frame_count / fps
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -53,8 +55,8 @@ def preprocess_frame(cap, fps,frame_count=0 ):
         "frame_count": frame_count,
         "current_time": current_time,
         "total_frames": total_frames,
-        "width":width,
-        "height":height
+        "width": width,
+        "height": height
     }
 
 def predict_frame(model, frame):
@@ -110,9 +112,16 @@ def analytics_step(analytics, detections, current_time):
         )
     )
 
-    events.extend(
-        analytics.detect_cash(detections['cash'],detections['customer'],current_time)
-    )
+    # Update per-person behavior (staff/customer signals)
+    try:
+        events.extend(analytics.update_person_behavior(
+            customers=detections.get('customer', []),
+            current_time=current_time,
+            cashiers=detections.get('cashier', [])
+        ))
+    except Exception:
+        pass
+
     return events
 
 def debug_step(frame_count, total_frames, detections, analytics):
@@ -146,7 +155,9 @@ def render_frame(frame, detections, analytics, events, current_time, width, heig
 
             label = cls_name
             if track_id is not None:
-                label = f"{cls_name} #{track_id}"
+                # Append person classification label including staff source
+                person_label = analytics.get_person_label(track_id)
+                label = f"{cls_name} #{track_id} [{person_label}]"
 
             cv2.putText(
                 frame,
