@@ -4,6 +4,7 @@ import cv2
 from app.retail_analytics import RetailAnalytics
 import threading
 import time
+import shutil
 import os
 import tempfile
 from pathlib import Path
@@ -37,7 +38,6 @@ class Prediction:
         self.frame_count = 0
         self.recording_enabled = False
 
-
     def set_target_fps(self, target_fps):
         """Update the target FPS for frame processing"""
         with self._lock:
@@ -66,16 +66,26 @@ class Prediction:
             print(f"Error releasing video capture on final cleanup: {e}")
         return False
 
-    def enable_recording(self):
-        """Start recording video to temp file"""
+    def enable_recording(self, output_dir=None):
+        """Start recording video to temp file on the same drive as output_dir"""
         with self._lock:
             if self.recording_enabled:
                 return True
-            
+
             try:
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-                self.temp_video_path = tmp.name
-                tmp.close()
+                if output_dir:
+                    # Ensure output_dir exists
+                    os.makedirs(output_dir, exist_ok=True)
+                    # Temp file on same drive
+                    self.temp_video_path = os.path.join(
+                        output_dir,
+                        f"txn_{int(time.time()*1000)}.mp4"
+                    )
+                else:
+                    # fallback to system temp folder
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+                    self.temp_video_path = tmp.name
+                    tmp.close()
 
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 self.out = cv2.VideoWriter(
@@ -84,11 +94,11 @@ class Prediction:
                     self.source_fps,
                     (self.width, self.height)
                 )
-                
+
                 if not self.out.isOpened():
                     print("Error: Failed to initialize video writer")
                     return False
-                
+
                 self.recording_enabled = True
                 self.frame_count = 0  # Reset frame counter for this sale
                 print(f"✓ Recording started: {self.temp_video_path}")
@@ -96,22 +106,16 @@ class Prediction:
             except Exception as e:
                 print(f"Error enabling recording: {e}")
                 return False
-    
+        
     def disable_recording(self):
-        """Stop recording video and flush frames to disk"""
         with self._lock:
             if not self.recording_enabled:
                 return
-            
-            try:
-                if self.out is not None and self.out.isOpened():
-                    # Flush any remaining frames to disk
-                    time.sleep(0.1)
-                    self.out.release()
-                self.recording_enabled = False
-                print("✓ Recording stopped and flushed")
-            except Exception as e:
-                print(f"Error disabling recording: {e}")
+            self.recording_enabled = False
+            if self.out is not None and self.out.isOpened():
+                self.out.release()
+                self.out = None
+            print("✓ Recording stopped and flushed")
 
     def _run_prediction_loop(self):
         """Thread target: runs the prediction loop (continuous monitoring)"""
@@ -145,9 +149,8 @@ class Prediction:
                     if self.recording_enabled and self.frame is not None:
                         with self._lock:
                             if self.out is not None and self.out.isOpened():
-                                self.out.write(self.frame)
-                    
-                    self.frame_count += 1
+                                frame_copy = self.frame.copy()
+                                self.out.write(frame_copy)
                 except Exception as e:
                     print(f"Error processing frame: {e}")
                     continue
@@ -184,19 +187,18 @@ class Prediction:
         self.thread.start()
 
     def save_video(self, OUTPUT_PATH):
-        """Save the recorded video from temp location to the specified output path"""
         if not self.temp_video_path or not os.path.exists(self.temp_video_path):
             print("Error: No temporary video recording found to save")
             return False
-        
+
         try:
-            os.replace(self.temp_video_path, OUTPUT_PATH)
-            print(f"Video saved to {OUTPUT_PATH}")
+            shutil.move(self.temp_video_path, OUTPUT_PATH)  # ✅ works across drives
+            print(f"✓ Video saved to {OUTPUT_PATH}")
             return True
         except Exception as e:
-            print(f"Error saving video: {e}")
+            print(f"✗ Error saving video: {e}")
             return False
-    
+        
     def print_output(self, pos_wallet: bool = False, pos_member: bool = False) -> Tuple[Dict, Dict]:
 
         output = {
@@ -205,8 +207,8 @@ class Prediction:
             "scanner_moving": True,
             "pos_member": pos_member,
             "suspicious_activity": False,
-            "customer_paid_wallet": False,
-            "customer_paid_cash": False,
+            "customer_paid_wallet": pos_wallet,
+            "customer_paid_cash": not pos_wallet,
             "purchasing_customer": False,
             "member_use": False
         }
@@ -214,61 +216,62 @@ class Prediction:
         developer_message = {}
         self.suspicious = False
 
-        has_customer = bool(self.analytics.customer_visits)
-        has_cash = bool(self.analytics.cash_detected)
-        has_member_scan = len(self.analytics.completed_payments) > 0
-
-        # WALLET PAYMENT (POS CONFIRMED – SHORT CIRCUIT)
+        # WALLET PAYMENT (POS CONFIRMED – NO CASH REQUIRED)
         if pos_wallet:
             output.update({
-                "customer_paid_wallet": True,
                 "purchasing_customer": True,
                 "member_use": pos_member
             })
             return output, developer_message
 
-        # CASH + MEMBER DETECTION
-        output["customer_paid_cash"] = has_cash
+        # CASH FLOW
+        # 🔒 Enforce CV only if POS says member
+        if pos_member:
+            has_customer = bool(self.analytics.customer_visits)
+            has_cash = bool(self.analytics.cash_detected)
+            has_member_scan = len(self.analytics.completed_payments) > 0
 
-        if has_customer and has_cash and has_member_scan:
-            output["purchasing_customer"] = True
-            output["member_use"] = True
+            if has_customer and has_cash and has_member_scan:
+                output["purchasing_customer"] = True
+                output["member_use"] = True
+            else:
+                output["suspicious_activity"] = True
+                self.suspicious = True
+
+                if not has_customer:
+                    developer_message["customer_detection"] = "POSM1-MODELC0"
+                if not has_cash:
+                    # 🔥 This is your staff-fraud signal
+                    developer_message["cash_detection"] = "POSM1-MODELB0"
+                if not has_member_scan:
+                    developer_message["member_detection"] = "POSM1-MODELM0"
+
+        # NON-MEMBER CASH TRANSACTION → DO NOT ENFORCE CV
         else:
-            output["suspicious_activity"] = True
-            self.suspicious = True
-
-            if not has_customer:
-                developer_message["customer_detection"] = "POSC1-MODELC0"
-            if not has_cash:
-                developer_message["cash_detection"] = "POSB1-MODELB0"
-            if not has_member_scan:
-                developer_message["member_detection"] = "POSM1-MODELM0"
+            output["purchasing_customer"] = True
+            output["member_use"] = False
 
         return output, developer_message
-
-    def stop_prediction(self, path):
-        # Signal the loop to stop and clear running flag
+    
+    def stop_prediction(self):
+        """Stop prediction loop and flush recording safely (do NOT save video)"""
         self.stop_event.set()
         self.running = False
 
         if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=5)
+            self.thread.join(timeout=10)
 
-        if not self.temp_video_path or not os.path.exists(self.temp_video_path):
-            raise FileNotFoundError(
-                f"Temp recording not found: {self.temp_video_path}"
-            )
+        # Force close writer
+        with self._lock:
+            if self.out is not None:
+                try:
+                    if self.out.isOpened():
+                        self.out.release()
+                except Exception as e:
+                    print(f"Error releasing VideoWriter: {e}")
+                finally:
+                    self.out = None
+            self.recording_enabled = False
 
-        if self.suspicious:
-            final_path = f"{path}.mp4"
-            os.replace(self.temp_video_path, final_path)
-            # Clear stop event so next run can start cleanly
-            self.stop_event.clear()
-            return True
-
-        try:
-            os.remove(self.temp_video_path)
-        finally:
-            # Clear stop event so next run can start cleanly
-            self.stop_event.clear()
-        return False
+        self.stop_event.clear()
+        print("✓ Prediction stopped cleanly")

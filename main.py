@@ -3,11 +3,10 @@ from app.variables import MODEL_PATH, VIDEO_PATH
 from app.retail_analytics import RetailAnalytics
 from flask import Flask, request, jsonify
 import os
-
+import re
 app = Flask(__name__)
 model = None
 
-@app.before_first_request
 def initialize_model():
     """Initialize the model and auto-start prediction at 10 fps"""
     global model
@@ -23,14 +22,22 @@ def initialize_model():
         raise
 
 
+@app.before_request
+def initialize_once():
+    if not hasattr(app, "_model_initialized"):
+        initialize_model()
+        app._model_initialized = True
+
+
 @app.route("/start_prediction", methods=["POST"])
 def start_prediction():
     try:
         # Change fps to 25 when requested
         model.set_target_fps(25)
-        
-        # Enable recording for this sale
-        if not model.enable_recording():
+        output_dir = r"E:\IGS_record"  # same disk as final storage
+        os.makedirs(output_dir, exist_ok=True)
+
+        if not model.enable_recording(output_dir=output_dir):
             return jsonify({"error": "Failed to enable recording"}), 500
         
         return jsonify({"message": "Recording started for sale at 25 fps"}), 200
@@ -68,13 +75,23 @@ def stop_prediction():
         video_saved = False
         if model.suspicious and model.temp_video_path and os.path.exists(model.temp_video_path):
             try:
-                output_path = rf"E:\IGS_record\{voucher_number}.mp4"
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                os.replace(model.temp_video_path, output_path)
-                video_saved = True
-                print(f"✓ Suspicious activity recording saved: {output_path}")
+                output_dir = r"E:\IGS_record"
+                os.makedirs(output_dir, exist_ok=True)
+
+                safe_voucher = re.sub(r'[\\/:*?"<>|]', "_", voucher_number)
+                output_path = os.path.join(output_dir, f"{safe_voucher}.mp4")
+
+                if os.path.exists(model.temp_video_path):
+                    os.replace(model.temp_video_path, output_path)
+                    video_saved = True
+                    print(f"✓ Suspicious activity recording saved: {output_path}")
+                else:
+                    print(f"✗ Temp video not found: {model.temp_video_path}")
+
+            except PermissionError as e:
+                print(f"✗ File is locked / still being written: {e}")
             except Exception as e:
-                print(f"Error saving video: {e}")
+                print(f"✗ Error saving video: {e}")
         else:
             # Clean up temp file if not saving
             if model.temp_video_path and os.path.exists(model.temp_video_path):
