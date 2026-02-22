@@ -4,6 +4,8 @@ from app.retail_analytics import RetailAnalytics
 from flask import Flask, request, jsonify
 import os
 import re
+import getpass
+import time
 app = Flask(__name__)
 model = None
 
@@ -62,7 +64,7 @@ def stop_prediction():
         
         # Disable recording for this sale
         model.disable_recording()
-        
+        time.sleep(0.3)
         # Get prediction output with error handling
         try:
             output, developer_message = model.print_output(pos_wallet, pos_member)
@@ -73,33 +75,59 @@ def stop_prediction():
         
         # Save video only if suspicious activity detected
         video_saved = False
-        if model.suspicious and model.temp_video_path and os.path.exists(model.temp_video_path):
+        recording_debug = {
+            "suspicious": model.suspicious,
+            "temp_path": model.temp_video_path,
+            "temp_exists": False,
+            "output_dir_exists": False,
+            "e_drive_exists": os.path.exists("E:\\"),
+            "cwd": os.getcwd(),
+            "running_user": getpass.getuser(),
+            "error": None
+        }
+
+        output_dir = r"E:\IGS_record"
+        recording_debug["output_dir_exists"] = os.path.exists(output_dir)
+
+        if model.temp_video_path:
+            recording_debug["temp_exists"] = os.path.exists(model.temp_video_path)
+            
+        if model.suspicious:
+
+        temp_path = model.temp_video_path
+
+        if not temp_path:
+            recording_debug["error"] = "temp_video_path is None"
+
+        elif not isinstance(temp_path, (str, bytes, os.PathLike)):
+            recording_debug["error"] = f"Invalid temp path type: {type(temp_path)}"
+
+        elif not os.path.exists(temp_path):
+            recording_debug["error"] = "temp video file does not exist"
+
+        else:
             try:
-                output_dir = r"E:\IGS_record"
                 os.makedirs(output_dir, exist_ok=True)
 
                 safe_voucher = re.sub(r'[\\/:*?"<>|]', "_", voucher_number)
                 output_path = os.path.join(output_dir, f"{safe_voucher}.mp4")
 
-                if os.path.exists(model.temp_video_path):
-                    os.replace(model.temp_video_path, output_path)
-                    video_saved = True
-                    print(f"✓ Suspicious activity recording saved: {output_path}")
-                else:
-                    print(f"✗ Temp video not found: {model.temp_video_path}")
+                os.replace(temp_path, output_path)
+                video_saved = True
 
             except PermissionError as e:
-                print(f"✗ File is locked / still being written: {e}")
+                recording_debug["error"] = f"PermissionError: {str(e)}"
+
             except Exception as e:
-                print(f"✗ Error saving video: {e}")
+                recording_debug["error"] = f"Unexpected error: {str(e)}"
+
         else:
-            # Clean up temp file if not saving
+            # Not suspicious → delete temp file
             if model.temp_video_path and os.path.exists(model.temp_video_path):
                 try:
                     os.remove(model.temp_video_path)
                 except Exception as e:
-                    print(f"Error removing temp video: {e}")
-        
+                    recording_debug["error"] = f"Cleanup error: {str(e)}"
         # Reset for next sale (thread-safe reset)
         model.temp_video_path = None
         model.suspicious = False
@@ -110,7 +138,8 @@ def stop_prediction():
         return jsonify({
             "prediction_summary": output,
             "developer_message": developer_message,
-            "recording_saved": video_saved
+            "recording_saved": video_saved,
+            "recording_debug": recording_debug
         }), 200
 
     except Exception as e:
