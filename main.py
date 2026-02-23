@@ -91,35 +91,30 @@ def stop_prediction():
 
         if model.temp_video_path:
             recording_debug["temp_exists"] = os.path.exists(model.temp_video_path)
-            
+
         if model.suspicious:
 
-        temp_path = model.temp_video_path
+            if not model.temp_video_path:
+                recording_debug["error"] = "temp_video_path is None"
 
-        if not temp_path:
-            recording_debug["error"] = "temp_video_path is None"
+            elif not os.path.exists(model.temp_video_path):
+                recording_debug["error"] = "temp video file does not exist"
 
-        elif not isinstance(temp_path, (str, bytes, os.PathLike)):
-            recording_debug["error"] = f"Invalid temp path type: {type(temp_path)}"
+            else:
+                try:
+                    os.makedirs(output_dir, exist_ok=True)
 
-        elif not os.path.exists(temp_path):
-            recording_debug["error"] = "temp video file does not exist"
+                    safe_voucher = re.sub(r'[\\/:*?"<>|]', "_", voucher_number)
+                    output_path = os.path.join(output_dir, f"{safe_voucher}.mp4")
 
-        else:
-            try:
-                os.makedirs(output_dir, exist_ok=True)
+                    os.replace(model.temp_video_path, output_path)
+                    video_saved = True
 
-                safe_voucher = re.sub(r'[\\/:*?"<>|]', "_", voucher_number)
-                output_path = os.path.join(output_dir, f"{safe_voucher}.mp4")
+                except PermissionError as e:
+                    recording_debug["error"] = f"PermissionError: {str(e)}"
 
-                os.replace(temp_path, output_path)
-                video_saved = True
-
-            except PermissionError as e:
-                recording_debug["error"] = f"PermissionError: {str(e)}"
-
-            except Exception as e:
-                recording_debug["error"] = f"Unexpected error: {str(e)}"
+                except Exception as e:
+                    recording_debug["error"] = f"Unexpected error: {str(e)}"
 
         else:
             # Not suspicious → delete temp file
