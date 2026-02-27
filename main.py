@@ -80,7 +80,6 @@ def stop_prediction():
             "temp_path": model.temp_video_path,
             "temp_exists": False,
             "output_dir_exists": False,
-            "output_drive_exists": os.path.exists(os.path.splitdrive(output_dir)[0] + "\\"),
             "cwd": os.getcwd(),
             "running_user": getpass.getuser(),
             "error": None

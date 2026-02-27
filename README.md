@@ -13,8 +13,9 @@ python version 3.9+
 Run the following commands.
 
 ```bash
+python.exe -m pip install --upgrade pip
 python -m venv venv
-source venv/bin/activate
+venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
@@ -50,8 +51,7 @@ POST to `/stop_prediction` with a JSON body containing:
 {
   "pos_member": false,
   "pos_wallet": false,
-  "voucher_number": "<voucher-id>",
-  "cashier_id": "<cashier-id>"
+  "voucher_number": "<voucher-id>"
 }
 ```
 
@@ -63,17 +63,14 @@ curl -X POST http://localhost:8000/stop_prediction -H "Content-Type: application
 
 Response (200) example:
 
+Suspicious case
 ```json
-{
-  "prediction_summary": {
-    "items_scanned": true,
-    "cashier": true,
-    "scanner_moving": true,
-    "pos_member": false,
-    "suspicious_activity": false
-  },
-  "recording_saved": false
-}
+{"developer_message":{"customer_detection":"POSM1-MODELC0","member_detection":"POSM1-MODELM0"},"prediction_summary":{"cashier":true,"customer_paid_cash":true,"customer_paid_wallet":false,"items_scanned":true,"member_use":false,"pos_member":true,"purchasing_customer":false,"scanner_moving":true,"suspicious_activity":true},"recording_debug":{"cwd":"C:\\Users\\user1\\Desktop\\erke_final-main\\erke_final-main","error":null,"output_dir_exists":true,"running_user":"user1","suspicious":true,"temp_exists":true,"temp_path":"D:\\IGS_record\\txn_1772212031108.mp4"},"recording_saved":true}
+```
+
+Passed case
+```json
+{"developer_message":{"customer_detection":"POSM1-MODELC0","member_detection":"POSM1-MODELM0"},"prediction_summary":{"cashier":true,"customer_paid_cash":true,"customer_paid_wallet":false,"items_scanned":true,"member_use":false,"pos_member":true,"purchasing_customer":false,"scanner_moving":true,"suspicious_activity":true},"recording_debug":{"cwd":"C:\\Users\\user1\\Desktop\\erke_final-main\\erke_final-main","error":null,"output_dir_exists":true,"running_user":"user1","suspicious":true,"temp_exists":true,"temp_path":"D:\\IGS_record\\txn_1772212031108.mp4"},"recording_saved":true}
 ```
 
 Notes about the API: `/start_prediction` starts a background thread and returns immediately; if prediction is already running it returns an error. `/stop_prediction` reads the provided JSON and calls into the `Prediction` object's `print_output` and `stop_prediction` methods, returning the summary and whether a suspicious recording was saved.
