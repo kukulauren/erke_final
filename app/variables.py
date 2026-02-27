@@ -8,7 +8,7 @@ SCANNER_ITEM_DISTANCE=100
 SCANNER_MOVEMENT_THRESHOLD=3
 SCAN_COOLDOWN=1.5
 PAYMENT_COMPLETE_TIME=1.0
-
+OUTPUT_DIR="E:\IGS_record"
 STAFF_REENTRY_THRESHOLD=4              # Need 4+ re-entries within recent window (was 3)
 REENTRY_WINDOW=600.0                   # 10-minute window for counting recent re-entries (was 1 hour)
 REENTRY_MIN_SESSIONS=2                 # Must have at least 2 distinct sessions

@@ -1,5 +1,5 @@
 from pipeline import Prediction
-from app.variables import MODEL_PATH, VIDEO_PATH
+from app.variables import MODEL_PATH, VIDEO_PATH, OUTPUT_DIR
 from app.retail_analytics import RetailAnalytics
 from flask import Flask, request, jsonify
 import os
@@ -36,7 +36,7 @@ def start_prediction():
     try:
         # Change fps to 25 when requested
         model.set_target_fps(25)
-        output_dir = r"E:\IGS_record"  # same disk as final storage
+        output_dir = OUTPUT_DIR  # same disk as final storage
         os.makedirs(output_dir, exist_ok=True)
 
         if not model.enable_recording(output_dir=output_dir):
@@ -80,13 +80,13 @@ def stop_prediction():
             "temp_path": model.temp_video_path,
             "temp_exists": False,
             "output_dir_exists": False,
-            "e_drive_exists": os.path.exists("E:\\"),
+            "output_drive_exists": os.path.exists(os.path.splitdrive(output_dir)[0] + "\\"),
             "cwd": os.getcwd(),
             "running_user": getpass.getuser(),
             "error": None
         }
 
-        output_dir = r"E:\IGS_record"
+        output_dir = OUTPUT_DIR
         recording_debug["output_dir_exists"] = os.path.exists(output_dir)
 
         if model.temp_video_path:
