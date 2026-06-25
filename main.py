@@ -6,8 +6,11 @@ import os
 import re
 import getpass
 import time
+
 app = Flask(__name__)
+
 model = None
+
 
 def initialize_model():
     """Initialize the model and auto-start prediction at 10 fps"""
@@ -15,7 +18,7 @@ def initialize_model():
     try:
         model = Prediction(MODEL_PATH, VIDEO_PATH, target_fps=10)
         print("✓ Model loaded successfully at startup (target fps: 10)")
-        
+
         # Auto-start prediction on startup
         model.start_prediction()
         print("✓ Prediction started automatically on startup")
@@ -34,16 +37,16 @@ def initialize_once():
 @app.route("/start_prediction", methods=["POST"])
 def start_prediction():
     try:
-        # Change fps to 25 when requested
+        # Change fps to 25 when a sale starts
         model.set_target_fps(25)
-        output_dir = OUTPUT_DIR  # same disk as final storage
+
+        output_dir = OUTPUT_DIR
         os.makedirs(output_dir, exist_ok=True)
 
         if not model.enable_recording(output_dir=output_dir):
             return jsonify({"error": "Failed to enable recording"}), 500
-        
-        return jsonify({"message": "Recording started for sale at 25 fps"}), 200
 
+        return jsonify({"message": "Recording started for sale at 25 fps"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -61,74 +64,86 @@ def stop_prediction():
 
         if not voucher_number:
             return jsonify({"error": "voucher_number is required"}), 400
-        
-        # Disable recording for this sale
-        model.disable_recording()
-        time.sleep(0.3)
-        # Get prediction output with error handling
+
+        # ── Step 1: Collect analytics BEFORE stopping the writer ──────────────
+        # print_output reads self.analytics which is safe to read while the
+        # prediction loop is still running (it only writes analytics state,
+        # not the video writer).
         try:
             output, developer_message = model.print_output(pos_wallet, pos_member)
         except Exception as e:
             print(f"Error generating output summary: {e}")
             output = {"error": "Failed to generate prediction output"}
             developer_message = {"error": str(e)}
-        
-        # Save video only if suspicious activity detected
-        video_saved = False
+
+        # Snapshot suspicious flag NOW before we reset it below
+        is_suspicious = model.suspicious
+        temp_path_snapshot = model.temp_video_path
+
+        # ── Step 2: Disable recording and wait for the writer to flush ────────
+        # wait_for_flush=True ensures the file is completely written before we
+        # try to move it.  This is the key fix for the "file not saved" bug.
+        model.disable_recording(wait_for_flush=True, timeout=15.0)
+
+        # ── Step 3: Build debug info ──────────────────────────────────────────
+        output_dir = OUTPUT_DIR
         recording_debug = {
-            "suspicious": model.suspicious,
-            "temp_path": model.temp_video_path,
+            "suspicious": is_suspicious,
+            "temp_path": temp_path_snapshot,
             "temp_exists": False,
-            "output_dir_exists": False,
+            "output_dir_exists": os.path.exists(output_dir),
             "cwd": os.getcwd(),
             "running_user": getpass.getuser(),
             "error": None
         }
 
-        output_dir = OUTPUT_DIR
-        recording_debug["output_dir_exists"] = os.path.exists(output_dir)
+        if temp_path_snapshot:
+            recording_debug["temp_exists"] = os.path.exists(temp_path_snapshot)
 
-        if model.temp_video_path:
-            recording_debug["temp_exists"] = os.path.exists(model.temp_video_path)
+        # ── Step 4: Move or delete the recording ─────────────────────────────
+        video_saved = False
 
-        if model.suspicious:
-
-            if not model.temp_video_path:
+        if is_suspicious:
+            if not temp_path_snapshot:
                 recording_debug["error"] = "temp_video_path is None"
-
-            elif not os.path.exists(model.temp_video_path):
-                recording_debug["error"] = "temp video file does not exist"
-
+            elif not os.path.exists(temp_path_snapshot):
+                recording_debug["error"] = (
+                    "temp video file does not exist after flush – "
+                    "recording may have been too short or writer failed to open"
+                )
             else:
                 try:
                     os.makedirs(output_dir, exist_ok=True)
-
                     safe_voucher = re.sub(r'[\\/:*?"<>|]', "_", voucher_number)
                     output_path = os.path.join(output_dir, f"{safe_voucher}.mp4")
-
-                    os.replace(model.temp_video_path, output_path)
+                    os.replace(temp_path_snapshot, output_path)
                     video_saved = True
-
+                    print(f"✓ Suspicious recording saved: {output_path}")
                 except PermissionError as e:
                     recording_debug["error"] = f"PermissionError: {str(e)}"
-
+                    print(f"✗ {recording_debug['error']}")
                 except Exception as e:
                     recording_debug["error"] = f"Unexpected error: {str(e)}"
-
+                    print(f"✗ {recording_debug['error']}")
         else:
             # Not suspicious → delete temp file
-            if model.temp_video_path and os.path.exists(model.temp_video_path):
+            if temp_path_snapshot and os.path.exists(temp_path_snapshot):
                 try:
-                    os.remove(model.temp_video_path)
+                    os.remove(temp_path_snapshot)
+                    print("✓ Non-suspicious temp recording deleted")
                 except Exception as e:
                     recording_debug["error"] = f"Cleanup error: {str(e)}"
-        # Reset for next sale (thread-safe reset)
+
+        # ── Step 5: Reset state for the next transaction ──────────────────────
         model.temp_video_path = None
         model.suspicious = False
-        # Reset analytics for next transaction
+
         with model._lock:
             model.analytics = RetailAnalytics()
-        
+
+        # Drop back to monitoring FPS now that the sale is over
+        model.set_target_fps(10)
+
         return jsonify({
             "prediction_summary": output,
             "developer_message": developer_message,
