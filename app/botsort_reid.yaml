@@ -1,0 +1,19 @@
+# BoT-SORT tracker with ReID enabled.
+# ReID re-identifies people/objects after occlusion so track IDs stay stable,
+# which the staff/customer classification and action recognition depend on.
+# Based on ultralytics' default botsort.yaml.
+
+tracker_type: botsort
+track_high_thresh: 0.25 # threshold for the first association
+track_low_thresh: 0.1 # threshold for the second association
+new_track_thresh: 0.25 # threshold for init new track if the detection does not match any tracks
+track_buffer: 60 # frames to keep lost tracks alive (raised from 30: survive longer occlusions)
+match_thresh: 0.8 # threshold for matching tracks
+fuse_score: True # fuse confidence scores with the iou distances before matching
+
+# BoT-SORT settings
+gmc_method: sparseOptFlow # global motion compensation (camera is static, cheap anyway)
+proximity_thresh: 0.5 # minimum IoU for valid match with ReID
+appearance_thresh: 0.8 # minimum appearance similarity for ReID
+with_reid: True # ENABLED: appearance-based re-identification
+model: auto # native features from the detection model (no extra inference cost)
