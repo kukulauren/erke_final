@@ -1,6 +1,12 @@
-import numpy as np
+import logging
+
 import cv2
-from app.variables import CONF_THRESHOLD,SCANNER_ITEM_DISTANCE
+import numpy as np
+
+from app.variables import CONF_THRESHOLD, SCANNER_ITEM_DISTANCE, TRACKER_CONFIG
+
+logger = logging.getLogger(__name__)
+
 CLASS_NAMES = {0: 'cashier', 1: 'customer', 2: 'scanner', 3: 'item', 4: 'phone', 5: 'cash', 6: 'counter'}
 CLASS_COLORS = {
     'cashier': (0, 255, 0),
@@ -11,11 +17,15 @@ CLASS_COLORS = {
     'cash': (0, 255, 255),
     'counter': (128, 128, 128)
 }
+
+
 def get_distance(p1, p2):
     return np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
+
 def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+
 
 def boxes_overlap(box1, box2):
     """Check if two boxes overlap at all"""
@@ -24,6 +34,7 @@ def boxes_overlap(box1, box2):
     if box1[1] > box2[3] or box2[1] > box1[3]:  # No vertical overlap
         return False
     return True
+
 
 def get_box_iou(box1, box2):
     """Calculate IoU between two boxes"""
@@ -39,28 +50,17 @@ def get_box_iou(box1, box2):
 
     return intersection / union if union > 0 else 0
 
-def preprocess_frame(cap, fps):
-    """Extract frame from video and calculate metadata"""
-    ret, frame = cap.read()
-    if not ret:
-        return None, None
 
-    # Get frame position automatically from video capture
-    frame_count = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-    current_time = frame_count / fps
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    return frame, {
-        "frame_count": frame_count,
-        "current_time": current_time,
-        "total_frames": total_frames,
-        "width": width,
-        "height": height
-    }
+def read_frame(cap):
+    """Read one frame from the capture. Returns the frame or None at end/failure."""
+    ret, frame = cap.read()
+    return frame if ret else None
+
 
 def predict_frame(model, frame):
-    results = model.track(frame, persist=True, conf=CONF_THRESHOLD, verbose=False)
+    results = model.track(
+        frame, persist=True, conf=CONF_THRESHOLD, tracker=TRACKER_CONFIG, verbose=False
+    )
 
     detections = {k: [] for k in CLASS_NAMES.values()}
 
@@ -70,44 +70,38 @@ def predict_frame(model, frame):
     for box in results[0].boxes:
         cls_id = int(box.cls[0])
         cls_name = CLASS_NAMES.get(cls_id, 'unknown')
+        if cls_name == 'unknown':
+            continue
 
+        xyxy = box.xyxy[0].cpu().numpy()
         detections[cls_name].append({
-            'box': box.xyxy[0].cpu().numpy(),
+            'box': xyxy,
             'conf': float(box.conf[0]),
             'track_id': int(box.id[0]) if box.id is not None else None,
-            'center': get_center(box.xyxy[0])
+            'center': get_center(xyxy)
         })
 
     return detections
 
-def analytics_step(analytics, detections, current_time):
+
+def analytics_step(analytics, detections, current_time, wrists=None):
     events = []
 
     scanner_status = analytics.update_scanner_movement(
         detections['scanner'], current_time
     )
 
+    # Temporal action recognition: item scans, phone payments, cash handovers
     events.extend(
-        analytics.update_item_scanning(
-            detections['item'],
-            detections['scanner'],
-            scanner_status,
-            current_time
-        )
+        analytics.update_actions(detections, scanner_status, wrists, current_time)
     )
 
+    # Customer presence at the counter feeds `customer_visits`, which the
+    # suspicious-activity decision in Prediction.print_output depends on.
     events.extend(
-        analytics.update_payment_scanning(
-            detections['phone'],
-            detections['scanner'],
-            current_time
-        )
-    )
-
-    events.extend(
-        analytics.detect_cash(
-            detections.get('cash', []),
+        analytics.update_customer_at_counter(
             detections.get('customer', []),
+            detections.get('counter', []),
             current_time
         )
     )
@@ -120,24 +114,31 @@ def analytics_step(analytics, detections, current_time):
             cashiers=detections.get('cashier', [])
         ))
     except Exception:
-        pass
+        logger.exception("update_person_behavior failed")
 
     return events
+
 
 def debug_step(frame_count, total_frames, detections, analytics):
     if frame_count % 100 != 0:
         return
 
-    progress = (frame_count / total_frames) * 100
-    print(f"\nProgress: {progress:.1f}% ({frame_count}/{total_frames})")
-    print(f"  Scanners: {len(detections['scanner'])}, Items: {len(detections['item'])}")
+    if total_frames > 0:
+        progress = (frame_count / total_frames) * 100
+        logger.info("Progress: %.1f%% (%d/%d)", progress, frame_count, total_frames)
+    logger.info("  Scanners: %d, Items: %d", len(detections['scanner']), len(detections['item']))
 
     for scanner in detections['scanner']:
         sid = scanner.get('track_id') or 0
         moving = analytics.scanner_moving.get(sid, False)
-        print(f"  Scanner #{sid}: moving={moving}")
+        logger.info("  Scanner #%s: moving=%s", sid, moving)
 
-def render_frame(frame, detections, analytics, events, current_time, width, height):
+
+def render_frame(frame, detections, analytics, events, current_time, width, height, wrists=None):
+    # Cashier wrists from pose estimation
+    for wx, wy in (wrists or []):
+        cv2.circle(frame, (int(wx), int(wy)), 8, (0, 165, 255), -1)
+
     # Bounding boxes
     for cls_name, dets in detections.items():
         color = CLASS_COLORS.get(cls_name, (255, 255, 255))
@@ -183,3 +184,12 @@ def render_frame(frame, detections, analytics, events, current_time, width, heig
         cv2.putText(frame, event, (width - 400, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         y += 25
+
+    # Stats bar
+    stats = analytics.get_display_stats()
+    cv2.rectangle(frame, (0, height - 60), (width, height), (0, 0, 0), -1)
+    x = 20
+    for stat in stats:
+        cv2.putText(frame, stat, (x, height - 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        x += 220

@@ -1,18 +1,12 @@
-from collections import defaultdict
-from app.helper_functions import get_distance, get_box_iou, boxes_overlap
+from app.action_recognizer import ActionRecognizer
+from app.helper_functions import get_distance, boxes_overlap
 from app.variables import (
     CUSTOMER_DWELL_TIME,
-    SCANNER_PHONE_DISTANCE,
-    SCANNER_ITEM_DISTANCE,
     SCANNER_MOVEMENT_THRESHOLD,
-    PAYMENT_COMPLETE_TIME,
-    SCAN_COOLDOWN,
     STAFF_REENTRY_THRESHOLD,
     STAFF_CUMULATIVE_TIME,
     REENTRY_WINDOW,
     STAFF_CONFIDENCE_THRESHOLD,
-    RECENT_BEHAVIOR_WINDOW,
-    CONFIDENCE_DECAY_RATE,
     REENTRY_MIN_SESSIONS,
     STAFF_TIME_MIN_SESSIONS
 )
@@ -33,16 +27,14 @@ class RetailAnalytics:
         # Scanner tracking
         self.scanner_positions = {}  # scanner_id: [last_positions]
         self.scanner_moving = {}     # scanner_id: bool
+        self.scanner_ever_moved = False  # any scanner movement this transaction
 
-        # Item scanning
+        # Temporal action recognition (item scans, phone payments, cash)
+        self.action_recognizer = ActionRecognizer()
+
+        # Ledgers filled from confirmed actions
         self.scanned_items = []
-        self.last_scan_time = {}     # item_id: last_scan_time
-        self.current_overlaps = []
-
-        # Payment
-        self.payment_in_progress = None
         self.completed_payments = []
-        self.phone_tracks = defaultdict(list)
         self.payment_times = []
         self.cash_detected = []
 
@@ -73,6 +65,8 @@ class RetailAnalytics:
 
                 is_moving = movement > SCANNER_MOVEMENT_THRESHOLD
                 self.scanner_moving[scanner_id] = is_moving
+                if is_moving:
+                    self.scanner_ever_moved = True
 
                 scanner_status[scanner_id] = {
                     'moving': is_moving,
@@ -304,153 +298,42 @@ class RetailAnalytics:
                 return f"{classification}-2nd({confidence:.2f})"
         return classification
 
-    def update_item_scanning(self, items, scanners, scanner_status, current_time):
-        """
-        NEW LOGIC: Scanner MOVES and overlaps/near Item = Item Scanned
+    def update_actions(self, detections, scanner_status, wrists, current_time):
+        """Run temporal action recognition and record confirmed actions.
 
-        Conditions for scan:
-        1. Scanner bbox overlaps Item bbox OR distance < threshold
-        2. Scanner was MOVING (approaching the item)
-        3. Cooldown passed for this item
+        Replaces the old single-frame proximity checks for item scans, phone
+        payments and cash detection with sustained multi-frame evidence
+        (see app/action_recognizer.py).
         """
         events = []
-        self.current_overlaps = []
+        actions = self.action_recognizer.update(
+            detections, scanner_status, wrists, current_time
+        )
 
-        for scanner in scanners:
-            scanner_id = scanner.get('track_id') or 0
-            status = scanner_status.get(scanner_id, {})
-            is_moving = status.get('moving', False)
+        for action in actions:
+            kind = action['action']
 
-            scanner_box = scanner['box']
-            scanner_center = scanner['center']
+            if kind == 'item_scan':
+                self.scanned_items.append(action)
+                if len(self.scanned_items) > self.MAX_SCANNED_ITEMS:
+                    self.scanned_items.pop(0)
+                via = " (hand)" if action.get('wrist_evidence') else ""
+                events.append(f"✓ ITEM #{action['item_id']} SCANNED!{via}")
 
-            for item in items:
-                item_id = item.get('track_id') or id(item)
-                item_box = item['box']
-                item_center = item['center']
+            elif kind == 'phone_payment':
+                self.completed_payments.append(action)
+                if len(self.completed_payments) > self.MAX_COMPLETED_PAYMENTS:
+                    self.completed_payments.pop(0)
+                self.payment_times.append(action['duration'])
+                events.append("✓ PAYMENT COMPLETE (Mobile)")
 
-                # Check overlap (bbox intersection)
-                has_overlap = boxes_overlap(scanner_box, item_box)
-                iou = get_box_iou(scanner_box, item_box) if has_overlap else 0
+            elif kind == 'cash_handover':
+                self.cash_detected.append(action)
+                if len(self.cash_detected) > self.MAX_CASH_DETECTED:
+                    self.cash_detected.pop(0)
+                who = f"Customer #{action['customer_id']}" if action.get('customer_id') else "cashier hand"
+                events.append(f"💵 CASH DETECTED ({who})")
 
-                # Also check distance
-                dist = get_distance(scanner_center, item_center)
-                is_close = dist < SCANNER_ITEM_DISTANCE
-
-                # Either overlap OR very close
-                is_scanning_position = has_overlap or is_close
-
-                self.current_overlaps.append({
-                    'item_id': item_id,
-                    'scanner_id': scanner_id,
-                    'distance': dist,
-                    'has_overlap': has_overlap,
-                    'iou': iou,
-                    'is_close': is_close,
-                    'scanner_moving': is_moving
-                })
-
-                # SCAN DETECTION: Scanner moved and is now overlapping/close to item
-                if is_scanning_position and is_moving:
-                    # Check cooldown
-                    last_scan = self.last_scan_time.get(item_id, 0)
-                    if current_time - last_scan > SCAN_COOLDOWN:
-                        # SCANNED!
-                        self.scanned_items.append({
-                            'time': current_time,
-                            'item_id': item_id,
-                            'scanner_id': scanner_id,
-                            'distance': dist,
-                            'iou': iou
-                        })
-                        # Clean up old scan history to prevent memory growth
-                        if len(self.scanned_items) > self.MAX_SCANNED_ITEMS:
-                            self.scanned_items.pop(0)
-                        
-                        self.last_scan_time[item_id] = current_time
-                        # Clean up old scan time entries
-                        if len(self.last_scan_time) > self.MAX_LAST_SCAN_TIME_ENTRIES:
-                            oldest_key = min(self.last_scan_time.keys(), key=lambda k: self.last_scan_time[k])
-                            del self.last_scan_time[oldest_key]
-                        
-                        events.append(f"✓ ITEM #{item_id} SCANNED!")
-        return events
-
-    def update_payment_scanning(self, phones, scanners, current_time):
-        """Phone near scanner for 1s = payment complete (working well)"""
-        events = []
-        phone_near_scanner = False
-
-        for phone in phones:
-            phone_id = phone.get('track_id') or id(phone)
-
-            self.phone_tracks[phone_id].append({
-                'position': phone['center'],
-                'time': current_time
-            })
-            if len(self.phone_tracks[phone_id]) > self.MAX_PHONE_TRACKS:
-                self.phone_tracks[phone_id].pop(0)
-
-            for scanner in scanners:
-                dist = get_distance(phone['center'], scanner['center'])
-
-                if dist < SCANNER_PHONE_DISTANCE:
-                    phone_near_scanner = True
-
-                    if self.payment_in_progress is None:
-                        self.payment_in_progress = {
-                            'start_time': current_time,
-                            'phone_id': phone_id
-                        }
-                        events.append("📱 PAYMENT STARTED...")
-                    else:
-                        duration = current_time - self.payment_in_progress['start_time']
-                        if duration >= PAYMENT_COMPLETE_TIME:
-                            self.completed_payments.append({
-                                'time': current_time,
-                                'phone_id': phone_id,
-                                'duration': duration
-                            })
-                            # Clean up old payment history
-                            if len(self.completed_payments) > self.MAX_COMPLETED_PAYMENTS:
-                                self.completed_payments.pop(0)
-                            
-                            self.payment_times.append(duration)
-                            events.append("✓ PAYMENT COMPLETE (Mobile)")
-                            self.payment_in_progress = None
-                    break
-
-        if not phone_near_scanner and self.payment_in_progress:
-            self.payment_in_progress = None
-
-        return events
-
-    def detect_cash(self, cashes, customers, current_time):
-        """Detect cash near customers and generate events"""
-        events = []
-        active_ids = set()
-
-        for cash in cashes:
-            cash_id = cash.get('track_id') or id(cash)
-            active_ids.add(cash_id)
-
-            for customer in customers:
-                if boxes_overlap(cash['box'], customer['box']):
-                    customer_id = customer.get('track_id') or id(customer)
-                    customer.setdefault('paid_with_cash', []).append(cash_id)
-                    
-                    self.cash_detected.append({
-                        'event': 'cash_detected',
-                        'customer_id': customer_id,
-                        'cash_id': cash_id,
-                        'time': current_time
-                    })
-                    # Clean up old cash detection history
-                    if len(self.cash_detected) > self.MAX_CASH_DETECTED:
-                        self.cash_detected.pop(0)
-                    
-                    events.append(f"💵 CASH DETECTED (Customer #{customer_id})")
-                    break
         return events
 
     def update_customer_at_counter(self, customers, counters, current_time):
@@ -490,6 +373,13 @@ class RetailAnalytics:
                 del self.customers_at_counter[cid]
 
         return events
+
+    def cashier_seen(self):
+        """True if any person was ever classified as staff (primary or secondary)."""
+        return any(
+            rec.get('classification') == 'staff'
+            for rec in self.person_records.values()
+        )
 
     def get_display_stats(self):
         return [

@@ -1,87 +1,144 @@
-from ultralytics import YOLO
-
-from app.helper_functions import preprocess_frame, predict_frame, analytics_step, debug_step, render_frame
-
-import cv2
-from app.retail_analytics import RetailAnalytics
+import logging
+import os
+import queue
+import re
 import threading
 import time
-import shutil
-import os
-import tempfile
 from pathlib import Path
-from typing import Tuple, Dict
+from typing import Dict, Tuple
+
+import cv2
+from ultralytics import YOLO
+
+from app.helper_functions import analytics_step, predict_frame, render_frame
+from app.pose_estimator import PoseEstimator
+from app.retail_analytics import RetailAnalytics
+from app.variables import (
+    FRAME_QUEUE_SIZE,
+    POSE_ENABLED,
+    POSE_MODEL_PATH,
+)
+from app.video_writer import create_video_writer
+
+logger = logging.getLogger(__name__)
+
+STREAM_PREFIXES = ("rtsp://", "rtmp://", "http://", "https://", "udp://", "tcp://")
+
+_SENTINEL = object()  # end-of-stream marker on the frame queue
 
 
 class Prediction:
+    """Video analytics pipeline.
+
+    Two threads decoupled by a bounded frame queue:
+      - capture thread: reads frames from the file/stream (and reconnects
+        streams); never blocked by inference, so RTSP frames don't go stale.
+      - worker thread: YOLO tracking (BoT-SORT + ReID), pose estimation,
+        temporal action recognition, rendering, and recording.
+    """
 
     def __init__(self, MODEL_PATH, VIDEO_PATH, confidence=0.7, target_fps=10):
         # Validate model path early to provide clear errors
         if not Path(MODEL_PATH).exists():
             raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+        if not VIDEO_PATH:
+            raise ValueError("VIDEO_PATH is empty – set it in .env or app/variables.py")
 
         self.model = YOLO(MODEL_PATH)
+        self.pose = PoseEstimator(POSE_MODEL_PATH) if POSE_ENABLED else None
         self.confidence = confidence
-        self.rtsp_path = VIDEO_PATH
+        self.video_source = VIDEO_PATH
+        # Live streams get wall-clock time and infinite reconnects; files get
+        # frame-based time and stop at end of file.
+        self.is_stream = str(VIDEO_PATH).lower().startswith(STREAM_PREFIXES)
+
         self.running = False
-        self.cap = cv2.VideoCapture(VIDEO_PATH)
         self._lock = threading.Lock()
-        self.thread = None
+        self.capture_thread = None
+        self.worker_thread = None
+        self.frame_queue = queue.Queue(maxsize=FRAME_QUEUE_SIZE)
         self.analytics = RetailAnalytics()
 
-        # Event used to request the prediction loop to stop
+        # Event used to request the pipeline to stop
         self.stop_event = threading.Event()
 
-        self.source_fps = int(self.cap.get(cv2.CAP_PROP_FPS)) or 25
+        self.cap = None
+        self.source_fps = 25
+        self.width = 0
+        self.height = 0
+        self.total_frames = 0
+        self._open_capture()
+
         self.target_fps = target_fps  # FPS at which to process frames
         self.frame_skip_interval = max(1, int(round(self.source_fps / self.target_fps)))
-
-        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         self.suspicious = False
         self.frame = None
         self.out = None
         self.temp_video_path = None
         self.frame_count = 0
+        self.frames_dropped = 0
         self.recording_enabled = False
+        self._loop_started_at = None
 
         # Event set when the writer has been safely flushed and closed
         self._recording_flushed = threading.Event()
         self._recording_flushed.set()  # Initially "flushed" (nothing to flush)
+
+    # ── Capture management ───────────────────────────────────────────────────
+
+    def _open_capture(self) -> bool:
+        """Open (or re-open) the video source, releasing any previous handle."""
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception as e:
+                logger.warning("Error releasing previous capture: %s", e)
+
+        self.cap = cv2.VideoCapture(self.video_source)
+        if not self.cap.isOpened():
+            return False
+
+        self.source_fps = int(self.cap.get(cv2.CAP_PROP_FPS)) or 25
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        return True
+
+    def _reconnect(self, attempts=0, delay=2.0) -> bool:
+        """Try to re-open the source. attempts=0 means retry forever (streams)."""
+        attempt = 0
+        while not self.stop_event.is_set():
+            attempt += 1
+            if self._open_capture():
+                logger.info("Reconnected to video source on attempt %d", attempt)
+                return True
+            if attempts and attempt >= attempts:
+                break
+            logger.warning(
+                "Failed to open video source (attempt %d%s), retrying in %.1fs...",
+                attempt, f"/{attempts}" if attempts else "", delay
+            )
+            # Sleep in small chunks so stop_event can interrupt promptly
+            deadline = time.time() + delay
+            while time.time() < deadline and not self.stop_event.is_set():
+                time.sleep(0.2)
+        return False
 
     def set_target_fps(self, target_fps):
         """Update the target FPS for frame processing"""
         with self._lock:
             self.target_fps = target_fps
             self.frame_skip_interval = max(1, int(round(self.source_fps / self.target_fps)))
-            print(f"Target FPS updated to {target_fps} (processing every {self.frame_skip_interval} frame(s))")
+            logger.info(
+                "Target FPS updated to %s (processing every %d frame(s))",
+                target_fps, self.frame_skip_interval
+            )
 
-    def capture_video(self, reconnect_attempts=3, reconnect_delay=2.0):
-        attempt = 0
-        while attempt < reconnect_attempts:
-            self.cap = cv2.VideoCapture(self.rtsp_path)
-            if self.cap.isOpened():
-                return True
-            attempt += 1
-            print(f"Failed to open RTSP stream (attempt {attempt}/{reconnect_attempts}), retrying in {reconnect_delay}s...")
-            try:
-                self.cap.release()
-            except Exception as e:
-                print(f"Error releasing video capture: {e}")
-            time.sleep(reconnect_delay)
-
-        # explicit failure
-        try:
-            if self.cap:
-                self.cap.release()
-        except Exception as e:
-            print(f"Error releasing video capture on final cleanup: {e}")
-        return False
+    # ── Recording ────────────────────────────────────────────────────────────
 
     def enable_recording(self, output_dir=None):
-        """Start recording video to temp file on the same drive as output_dir."""
+        """Start recording video to a temp file on the same drive as output_dir."""
         with self._lock:
             if self.recording_enabled:
                 return True
@@ -94,193 +151,338 @@ class Prediction:
                         f"txn_{int(time.time() * 1000)}.mp4"
                     )
                 else:
+                    import tempfile
                     tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
                     self.temp_video_path = tmp.name
                     tmp.close()
 
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                self.out = cv2.VideoWriter(
-                    self.temp_video_path,
-                    fourcc,
-                    self.source_fps,
-                    (self.width, self.height)
+                self.out = create_video_writer(
+                    self.temp_video_path, self.source_fps, (self.width, self.height)
                 )
-
-                if not self.out.isOpened():
-                    print("Error: Failed to initialize video writer")
-                    self.out = None
+                if self.out is None:
                     return False
 
                 self.recording_enabled = True
-                self.frame_count = 0
                 self._recording_flushed.clear()  # Mark as "not yet flushed"
-                print(f"✓ Recording started: {self.temp_video_path}")
+                logger.info("Recording started: %s", self.temp_video_path)
                 return True
 
             except Exception as e:
-                print(f"Error enabling recording: {e}")
+                logger.exception("Error enabling recording: %s", e)
                 return False
-
-    def _flush_and_close_writer(self):
-        """
-        Internal: release the VideoWriter under lock and signal completion.
-        Must only be called from within the prediction thread or with no
-        concurrent writers active.
-        """
-        with self._lock:
-            if self.out is not None:
-                try:
-                    if self.out.isOpened():
-                        self.out.release()
-                except Exception as e:
-                    print(f"Error releasing VideoWriter: {e}")
-                finally:
-                    self.out = None
-            self.recording_enabled = False
-        self._recording_flushed.set()
-        print("✓ Recording flushed and closed")
 
     def disable_recording(self, wait_for_flush=True, timeout=10.0):
         """
         Signal the recording to stop.  The actual writer release is done by
-        the prediction loop thread at the end of its next iteration so that
-        no frame is written after the writer has been closed.
+        the worker thread at the end of its next iteration so that no frame
+        is written after the writer has been closed.
 
         If wait_for_flush=True (the default) this call blocks until the writer
         has been fully released, which is required before the caller tries to
         move/delete the file.
         """
         with self._lock:
-            if not self.recording_enabled:
-                # Nothing to do – but still wait in case a flush is in progress
-                pass
-            else:
-                # Tell the loop to stop writing and close the writer.
-                # The loop checks this flag and calls _flush_and_close_writer.
+            if self.recording_enabled:
+                # Tell the worker to stop writing; it closes the writer itself.
                 self.recording_enabled = False
 
         if wait_for_flush:
             flushed = self._recording_flushed.wait(timeout=timeout)
             if not flushed:
-                print("Warning: recording flush timed out; forcing writer close")
-                self._flush_and_close_writer()
+                logger.warning("Recording flush timed out; forcing writer close")
+                self._force_close_writer()
 
-    def _run_prediction_loop(self):
-        """Thread target: runs the prediction loop (continuous monitoring)"""
-        try:
-            self.frame_count = 0
+    def _force_close_writer(self):
+        """Release the writer from outside the worker (fallback path only)."""
+        with self._lock:
+            out = self.out
+            self.out = None
+            self.recording_enabled = False
+        if out is not None:
+            try:
+                out.release()
+            except Exception as e:
+                logger.warning("Error releasing video writer: %s", e)
+        self._recording_flushed.set()
 
-            while self.running and not self.stop_event.is_set():
+    def finalize_recording(self, voucher_number: str, output_dir: str) -> Tuple[bool, Dict]:
+        """
+        Move the temp recording to its final name if the transaction was
+        suspicious, otherwise delete it.  Also resets recording state.
+        Returns (video_saved, debug_info).
+        """
+        import getpass
+
+        is_suspicious = self.suspicious
+        temp_path = self.temp_video_path
+
+        debug = {
+            "suspicious": is_suspicious,
+            "temp_path": temp_path,
+            "temp_exists": bool(temp_path) and os.path.exists(temp_path),
+            "output_dir_exists": os.path.exists(output_dir),
+            "cwd": os.getcwd(),
+            "running_user": getpass.getuser(),
+            "error": None
+        }
+
+        video_saved = False
+
+        if is_suspicious:
+            if not temp_path:
+                debug["error"] = "temp_video_path is None"
+            elif not os.path.exists(temp_path):
+                debug["error"] = (
+                    "temp video file does not exist after flush – "
+                    "recording may have been too short or writer failed to open"
+                )
+            else:
                 try:
-                    self.frame, meta = preprocess_frame(self.cap, self.source_fps)
-                    if self.frame is None:
-                        break
-
-                    should_process = (self.frame_count % self.frame_skip_interval) == 0
-
-                    if should_process:
-                        current_time = meta["current_time"]
-                        detections = predict_frame(self.model, self.frame)
-                        events = analytics_step(self.analytics, detections, current_time)
-                        render_frame(
-                            self.frame,
-                            detections,
-                            self.analytics,
-                            events,
-                            current_time,
-                            self.width,
-                            self.height
-                        )
-
-                    # Write frame under lock; also detect if recording was disabled
-                    # and flush the writer in THIS thread (owner of the writer).
-                    with self._lock:
-                        if self.out is not None and self.out.isOpened() and self.frame is not None:
-                            self.out.write(self.frame.copy())
-
-                        # If recording was disabled externally, flush now.
-                        if not self.recording_enabled and self.out is not None:
-                            try:
-                                if self.out.isOpened():
-                                    self.out.release()
-                            except Exception as e:
-                                print(f"Error releasing VideoWriter in loop: {e}")
-                            finally:
-                                self.out = None
-                            # Signal that the flush is done (outside the lock below)
-                            should_signal = True
-                        else:
-                            should_signal = False
-
-                    if should_signal:
-                        self._recording_flushed.set()
-                        print("✓ Recording flushed inside prediction loop")
-
-                    self.frame_count += 1
-
+                    os.makedirs(output_dir, exist_ok=True)
+                    safe_voucher = re.sub(r'[\\/:*?"<>|]', "_", voucher_number)
+                    output_path = os.path.join(output_dir, f"{safe_voucher}.mp4")
+                    os.replace(temp_path, output_path)
+                    video_saved = True
+                    logger.info("Suspicious recording saved: %s", output_path)
                 except Exception as e:
-                    print(f"Error processing frame: {e}")
-                    continue
+                    debug["error"] = f"{type(e).__name__}: {e}"
+                    logger.error("Failed to save recording: %s", debug["error"])
+        else:
+            # Not suspicious → delete temp file
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                    logger.info("Non-suspicious temp recording deleted")
+                except Exception as e:
+                    debug["error"] = f"Cleanup error: {e}"
 
+        self.temp_video_path = None
+        self.suspicious = False
+        return video_saved, debug
+
+    def reset_analytics(self):
+        """Fresh analytics state for the next transaction."""
+        with self._lock:
+            self.analytics = RetailAnalytics()
+
+    # ── Capture thread ───────────────────────────────────────────────────────
+
+    def _capture_loop(self):
+        """Read frames as fast as the source delivers them and enqueue them.
+
+        Streams: if the worker falls behind and the queue fills up, the oldest
+        frame is dropped so processing stays real-time instead of drifting
+        seconds behind the camera.
+        Files: the put blocks (backpressure) so no frame is skipped.
+        """
+        try:
+            while self.running and not self.stop_event.is_set():
+                ret, frame = self.cap.read()
+                if not ret:
+                    if self.is_stream:
+                        logger.warning("Lost stream, attempting to reconnect...")
+                        if self._reconnect(attempts=0):
+                            continue
+                    break  # end of file or unrecoverable stream
+
+                if self.is_stream:
+                    try:
+                        self.frame_queue.put_nowait(frame)
+                    except queue.Full:
+                        try:
+                            self.frame_queue.get_nowait()  # drop oldest
+                            self.frames_dropped += 1
+                        except queue.Empty:
+                            pass
+                        try:
+                            self.frame_queue.put_nowait(frame)
+                        except queue.Full:
+                            self.frames_dropped += 1
+                else:
+                    while not self.stop_event.is_set():
+                        try:
+                            self.frame_queue.put(frame, timeout=0.5)
+                            break
+                        except queue.Full:
+                            continue
         except Exception as e:
-            print(f"Error in prediction loop: {e}")
+            logger.exception("Error in capture loop: %s", e)
         finally:
             try:
                 if self.cap:
                     self.cap.release()
             except Exception as e:
-                print(f"Error releasing video capture: {e}")
+                logger.warning("Error releasing video capture: %s", e)
+            # Wake the worker so it can exit
+            try:
+                self.frame_queue.put(_SENTINEL, timeout=1.0)
+            except queue.Full:
+                pass
+            logger.info("Capture loop exited (%d frames dropped)", self.frames_dropped)
 
-            # Make sure writer is always closed when the loop exits
-            with self._lock:
-                out = self.out
-                self.out = None
-                self.recording_enabled = False
-            if out is not None:
+    # ── Worker thread ────────────────────────────────────────────────────────
+
+    def _current_time(self) -> float:
+        """Transaction-relative time in seconds.
+
+        Streams use wall-clock time (frame positions are unreliable on RTSP);
+        files use frame index / fps so timing is correct even when processing
+        faster than real time.
+        """
+        if self.is_stream:
+            return time.time() - self._loop_started_at
+        return self.frame_count / self.source_fps
+
+    def _worker_loop(self):
+        """Inference, analytics, rendering and recording."""
+        self._loop_started_at = time.time()
+        self.frame_count = 0
+
+        try:
+            while not self.stop_event.is_set():
                 try:
-                    if out.isOpened():
-                        out.release()
+                    frame = self.frame_queue.get(timeout=0.5)
+                except queue.Empty:
+                    if not self.running:
+                        break
+                    continue
+                if frame is _SENTINEL:
+                    break
+
+                try:
+                    self.frame = frame
+                    should_process = (self.frame_count % self.frame_skip_interval) == 0
+
+                    if should_process:
+                        current_time = self._current_time()
+                        detections = predict_frame(self.model, frame)
+
+                        wrists = []
+                        if self.pose is not None and detections['cashier']:
+                            wrists = self.pose.cashier_wrists(
+                                frame, [c['box'] for c in detections['cashier']]
+                            )
+
+                        with self._lock:
+                            analytics = self.analytics
+                        events = analytics_step(analytics, detections, current_time, wrists)
+                        render_frame(
+                            frame, detections, analytics, events,
+                            current_time, self.width, self.height, wrists
+                        )
+                        for event in events:
+                            logger.info("[%.1fs] %s", current_time, event)
+
+                    # Write frame under lock; also detect if recording was
+                    # disabled and flush the writer in THIS thread (its owner).
+                    should_signal = False
+                    with self._lock:
+                        if self.out is not None:
+                            self.out.write(frame)
+
+                        if not self.recording_enabled and self.out is not None:
+                            try:
+                                self.out.release()
+                            except Exception as e:
+                                logger.warning("Error releasing writer in worker: %s", e)
+                            finally:
+                                self.out = None
+                            should_signal = True
+
+                    if should_signal:
+                        self._recording_flushed.set()
+                        logger.info("Recording flushed inside worker loop")
+
+                    self.frame_count += 1
+
                 except Exception as e:
-                    print(f"Error releasing VideoWriter on loop exit: {e}")
-            self._recording_flushed.set()
+                    logger.exception("Error processing frame: %s", e)
+                    continue
 
+        except Exception as e:
+            logger.exception("Error in worker loop: %s", e)
+        finally:
+            # Make sure writer is always closed when the worker exits
+            self._force_close_writer()
             self.running = False
-            print("✓ Prediction loop exited")
+            logger.info("Worker loop exited")
 
-    def start_prediction(self):
+    # ── Lifecycle ────────────────────────────────────────────────────────────
+
+    def start_prediction(self) -> bool:
         with self._lock:
             if self.running:
-                return
+                return True
 
             self.stop_event.clear()
             self.running = True
 
-        if not self.capture_video():
-            self.running = False
-            return
+        # Re-open the source if the previous run released it (or never opened)
+        if self.cap is None or not self.cap.isOpened():
+            if not self._reconnect(attempts=3):
+                self.running = False
+                return False
 
-        self.thread = threading.Thread(target=self._run_prediction_loop, daemon=False)
-        self.thread.start()
+        # Drain any frames left over from a previous run
+        while not self.frame_queue.empty():
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
 
-    def save_video(self, OUTPUT_PATH):
-        """Move the completed temp recording to OUTPUT_PATH."""
-        if not self.temp_video_path or not os.path.exists(self.temp_video_path):
-            print("Error: No temporary video recording found to save")
-            return False
+        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=False)
+        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=False)
+        self.capture_thread.start()
+        self.worker_thread.start()
+        return True
 
-        try:
-            shutil.move(self.temp_video_path, OUTPUT_PATH)
-            print(f"✓ Video saved to {OUTPUT_PATH}")
-            return True
-        except Exception as e:
-            print(f"✗ Error saving video: {e}")
-            return False
+    def stop_prediction(self):
+        """Stop the pipeline entirely (e.g. on server shutdown)."""
+        self.stop_event.set()
+        self.running = False
+
+        for thread in (self.capture_thread, self.worker_thread):
+            if thread and thread.is_alive():
+                thread.join(timeout=10)
+
+        # Force-close writer if the worker didn't manage to do it
+        self._force_close_writer()
+
+        self.stop_event.clear()
+        logger.info("Prediction stopped cleanly")
+
+    # ── Output ───────────────────────────────────────────────────────────────
+
+    def status(self) -> Dict:
+        """Lightweight state snapshot for a health endpoint."""
+        with self._lock:
+            analytics = self.analytics
+        return {
+            "running": self.running,
+            "source": self.video_source,
+            "is_stream": self.is_stream,
+            "source_fps": self.source_fps,
+            "target_fps": self.target_fps,
+            "frames_processed": self.frame_count,
+            "frames_dropped": self.frames_dropped,
+            "queue_depth": self.frame_queue.qsize(),
+            "pose_enabled": self.pose is not None,
+            "recording": self.recording_enabled,
+            "temp_video_path": self.temp_video_path,
+            "items_scanned": len(analytics.scanned_items),
+            "payments": len(analytics.completed_payments),
+            "customer_visits": len(analytics.customer_visits),
+        }
 
     def print_output(self, pos_wallet: bool = False, pos_member: bool = False) -> Tuple[Dict, Dict]:
+        with self._lock:
+            analytics = self.analytics
+
+        # Observed CV signals (previously hardcoded to True)
         output = {
-            "items_scanned": True,
-            "cashier": True,
-            "scanner_moving": True,
+            "items_scanned": len(analytics.scanned_items) > 0,
+            "cashier": analytics.cashier_seen(),
+            "scanner_moving": analytics.scanner_ever_moved,
             "pos_member": pos_member,
             "suspicious_activity": False,
             "customer_paid_wallet": pos_wallet,
@@ -302,9 +504,9 @@ class Prediction:
 
         # CASH FLOW
         if pos_member:
-            has_customer = bool(self.analytics.customer_visits)
-            has_cash = bool(self.analytics.cash_detected)
-            has_member_scan = len(self.analytics.completed_payments) > 0
+            has_customer = bool(analytics.customer_visits)
+            has_cash = bool(analytics.cash_detected)
+            has_member_scan = len(analytics.completed_payments) > 0
 
             if has_customer and has_cash and has_member_scan:
                 output["purchasing_customer"] = True
@@ -326,27 +528,3 @@ class Prediction:
             output["member_use"] = False
 
         return output, developer_message
-
-    def stop_prediction(self):
-        """Stop prediction loop entirely (e.g. on server shutdown)."""
-        self.stop_event.set()
-        self.running = False
-
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=10)
-
-        # Force-close writer if the thread didn't manage to do it
-        with self._lock:
-            out = self.out
-            self.out = None
-            self.recording_enabled = False
-        if out is not None:
-            try:
-                if out.isOpened():
-                    out.release()
-            except Exception as e:
-                print(f"Error releasing VideoWriter in stop_prediction: {e}")
-        self._recording_flushed.set()
-
-        self.stop_event.clear()
-        print("✓ Prediction stopped cleanly")
