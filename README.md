@@ -132,6 +132,19 @@ transaction and processing drops back to `MONITORING_FPS`.
 Developer message codes: `POSM1-MODELC0` no customer seen, `POSM1-MODELB0`
 no cash seen, `POSM1-MODELM0` no member scan seen.
 
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Covers the temporal action recognizer (evidence accumulation, dropout
+tolerance, cooldowns, wrist evidence), analytics ledgers, counter dwell,
+staff classification, the full suspicious-activity decision matrix, the
+H.264 writer + mp4v fallback, transaction logging and calibration math.
+No YOLO models are loaded — the suite runs in a few seconds.
+
 ## Threshold calibration
 
 Every `/stop_prediction` writes a JSON evidence log to `TRANSACTION_LOG_DIR`
