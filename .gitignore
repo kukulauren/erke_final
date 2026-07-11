@@ -10,5 +10,7 @@ venv/
 # Generated at runtime — recordings, transaction logs, test output
 IGS_record/
 logs/
+training_data/
 output_result.mp4
 *.avi
+.pytest_cache/

@@ -4,6 +4,7 @@ import threading
 
 from flask import Flask, jsonify, request
 
+from app.retention import start_retention_thread
 from app.transaction_logger import log_transaction
 from app.variables import (
     MODEL_PATH,
@@ -36,6 +37,9 @@ def initialize_model():
         logger.info("Prediction started automatically on startup")
     else:
         logger.error("Could not open video source %r at startup", VIDEO_PATH)
+
+    # Daily cleanup of old clips/logs so the disk never silently fills up
+    start_retention_thread()
 
 
 @app.before_request
@@ -131,4 +135,13 @@ def stop_prediction():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    # Same host/port/endpoints/JSON either way — the POS integration is
+    # unaffected. waitress is just a production-grade WSGI server; if it is
+    # not installed we fall back to Flask's built-in dev server.
+    try:
+        from waitress import serve
+        logger.info("Serving with waitress on port 8000")
+        serve(app, host="0.0.0.0", port=8000, threads=8)
+    except ImportError:
+        logger.warning("waitress not installed, using Flask dev server")
+        app.run(host="0.0.0.0", port=8000)

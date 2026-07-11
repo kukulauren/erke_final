@@ -17,6 +17,8 @@ from app.variables import (
     FRAME_QUEUE_SIZE,
     POSE_ENABLED,
     POSE_MODEL_PATH,
+    TRAINING_CLIP_EVERY_N,
+    TRAINING_DATA_DIR,
 )
 from app.video_writer import create_video_writer
 
@@ -80,6 +82,7 @@ class Prediction:
         self.frames_dropped = 0
         self.recording_enabled = False
         self._loop_started_at = None
+        self._clean_clip_counter = 0  # for training-data sampling
 
         # Event set when the writer has been safely flushed and closed
         self._recording_flushed = threading.Event()
@@ -248,11 +251,28 @@ class Prediction:
                     debug["error"] = f"{type(e).__name__}: {e}"
                     logger.error("Failed to save recording: %s", debug["error"])
         else:
-            # Not suspicious → delete temp file
+            # Not suspicious → keep every Nth clip for future model training,
+            # delete the rest.
             if temp_path and os.path.exists(temp_path):
+                self._clean_clip_counter += 1
+                keep_for_training = (
+                    TRAINING_CLIP_EVERY_N > 0
+                    and self._clean_clip_counter % TRAINING_CLIP_EVERY_N == 0
+                )
                 try:
-                    os.remove(temp_path)
-                    logger.info("Non-suspicious temp recording deleted")
+                    if keep_for_training:
+                        train_dir = os.path.join(TRAINING_DATA_DIR, "clean")
+                        os.makedirs(train_dir, exist_ok=True)
+                        safe_voucher = re.sub(r'[\\/:*?"<>|]', "_", voucher_number)
+                        train_path = os.path.join(
+                            train_dir, f"{safe_voucher}_{int(time.time())}.mp4"
+                        )
+                        os.replace(temp_path, train_path)
+                        debug["training_clip"] = train_path
+                        logger.info("Clean clip kept for training: %s", train_path)
+                    else:
+                        os.remove(temp_path)
+                        logger.info("Non-suspicious temp recording deleted")
                 except Exception as e:
                     debug["error"] = f"Cleanup error: {e}"
 

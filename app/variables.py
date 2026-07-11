@@ -102,6 +102,16 @@ H264_PRESET = _env_str("H264_PRESET", "veryfast")
 # ── Transaction logging / calibration ────────────────────────────────────────
 TRANSACTION_LOG_DIR = _env_str("TRANSACTION_LOG_DIR", os.path.join("logs", "transactions"))
 
+# ── Disk retention ───────────────────────────────────────────────────────────
+RETENTION_DAYS = _env_int("RETENTION_DAYS", 30)          # suspicious clips in OUTPUT_DIR
+LOG_RETENTION_DAYS = _env_int("LOG_RETENTION_DAYS", 180)  # transaction JSON logs
+
+# ── Training data collection ─────────────────────────────────────────────────
+# Every Nth clean (non-suspicious) transaction clip is kept for future model
+# training instead of being deleted. 0 disables collection.
+TRAINING_DATA_DIR = _env_str("TRAINING_DATA_DIR", "training_data")
+TRAINING_CLIP_EVERY_N = _env_int("TRAINING_CLIP_EVERY_N", 20)
+
 # ── Server FPS profile ───────────────────────────────────────────────────────
 MONITORING_FPS = _env_int("MONITORING_FPS", 10)   # idle monitoring
 TRANSACTION_FPS = _env_int("TRANSACTION_FPS", 25)  # during an active sale

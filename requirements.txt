@@ -5,3 +5,4 @@ opencv-python>=4.9.0
 numpy>=1.26.0
 lap>=0.5.12
 av>=12.0.0
+waitress>=3.0.0
