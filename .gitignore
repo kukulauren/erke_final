@@ -1,0 +1,14 @@
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Generated at runtime — recordings, transaction logs, test output
+IGS_record/
+logs/
+output_result.mp4
+*.avi
