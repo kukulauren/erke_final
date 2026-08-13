@@ -41,12 +41,13 @@ class TestRetention:
         assert retention.cleanup_directory(str(tmp_path / "nope"), 30) == 0
 
 
-def make_prediction(temp_path, suspicious=False, counter=0):
+def make_prediction(temp_path, suspicious=False, counter=0, detections_path=None):
     """Prediction without YOLO/video, ready for finalize_recording."""
     p = Prediction.__new__(Prediction)
     p._lock = threading.Lock()
     p.suspicious = suspicious
     p.temp_video_path = temp_path
+    p.temp_detections_path = detections_path
     p._clean_clip_counter = counter
     return p
 
@@ -60,30 +61,55 @@ class TestTrainingClipSampling:
         kept = 0
         for i in range(6):
             clip = make_file(str(tmp_path / f"txn_{i}.mp4"))
-            p = make_prediction(clip, counter=i)  # counter becomes i+1 inside
+            detections = make_file(str(tmp_path / f"txn_{i}.jsonl"))
+            p = make_prediction(clip, counter=i, detections_path=detections)  # counter becomes i+1 inside
             saved, debug = p.finalize_recording(f"V{i}", str(tmp_path / "out"))
             assert saved is False  # clean clips are never "recording_saved"
             if "training_clip" in debug:
                 kept += 1
-                assert os.path.exists(debug["training_clip"])
+                video_path = debug["training_clip"]
+                assert os.path.exists(video_path)
+                assert os.path.basename(os.path.dirname(video_path)) == "videos"
+                stem = os.path.splitext(os.path.basename(video_path))[0]
+                detections_dest = os.path.join(
+                    os.path.dirname(os.path.dirname(video_path)), "detections", f"{stem}.jsonl"
+                )
+                assert os.path.exists(detections_dest)
                 assert not os.path.exists(clip)
+                assert not os.path.exists(detections)
             else:
                 assert not os.path.exists(clip)  # deleted
+                assert not os.path.exists(detections)
         assert kept == 2  # counters 3 and 6 out of 1..6
 
     def test_sampling_disabled_deletes_everything(self, tmp_path, monkeypatch):
         monkeypatch.setattr(pipeline_module, "TRAINING_CLIP_EVERY_N", 0)
         clip = make_file(str(tmp_path / "txn.mp4"))
-        p = make_prediction(clip, counter=0)
+        detections = make_file(str(tmp_path / "txn.jsonl"))
+        p = make_prediction(clip, counter=0, detections_path=detections)
         _, debug = p.finalize_recording("V1", str(tmp_path / "out"))
         assert "training_clip" not in debug
         assert not os.path.exists(clip)
+        assert not os.path.exists(detections)
 
     def test_suspicious_clip_still_saved_normally(self, tmp_path, monkeypatch):
         monkeypatch.setattr(pipeline_module, "TRAINING_CLIP_EVERY_N", 1)
         clip = make_file(str(tmp_path / "txn.mp4"))
-        p = make_prediction(clip, suspicious=True)
+        detections = make_file(str(tmp_path / "txn.jsonl"))
+        p = make_prediction(clip, suspicious=True, detections_path=detections)
         saved, debug = p.finalize_recording("SUS1", str(tmp_path / "out"))
         assert saved is True
-        assert os.path.exists(str(tmp_path / "out" / "SUS1.mp4"))
+        assert os.path.exists(str(tmp_path / "out" / "videos" / "SUS1.mp4"))
+        assert os.path.exists(str(tmp_path / "out" / "detections" / "SUS1.jsonl"))
         assert "training_clip" not in debug
+
+    def test_suspicious_clip_without_detections_sidecar(self, tmp_path, monkeypatch):
+        """A detections file isn't guaranteed (e.g. logger failed to open) —
+        the video should still be saved without erroring."""
+        monkeypatch.setattr(pipeline_module, "TRAINING_CLIP_EVERY_N", 1)
+        clip = make_file(str(tmp_path / "txn.mp4"))
+        p = make_prediction(clip, suspicious=True, detections_path=None)
+        saved, debug = p.finalize_recording("SUS2", str(tmp_path / "out"))
+        assert saved is True
+        assert os.path.exists(str(tmp_path / "out" / "videos" / "SUS2.mp4"))
+        assert not os.path.exists(str(tmp_path / "out" / "detections"))

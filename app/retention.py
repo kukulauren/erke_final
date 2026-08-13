@@ -1,8 +1,11 @@
 """Disk retention for recordings and transaction logs.
 
 Prevents the disk from silently filling up over months of operation:
-  - suspicious clips in OUTPUT_DIR older than RETENTION_DAYS are deleted
-    (this also sweeps up orphaned txn_*.mp4 temp files from crashed runs)
+  - suspicious clips (OUTPUT_DIR/videos/*.mp4 + OUTPUT_DIR/detections/*.jsonl)
+    older than RETENTION_DAYS are deleted
+  - orphaned txn_*.mp4 / txn_*.jsonl temp files left directly in OUTPUT_DIR
+    by crashed runs (finalize_recording never got to move them) are swept
+    the same way
   - transaction JSON logs older than LOG_RETENTION_DAYS are deleted
   - TRAINING_DATA_DIR is never touched — training clips are curated manually
 
@@ -50,8 +53,15 @@ def cleanup_directory(directory, older_than_days, pattern="*"):
 
 def run_cleanup():
     """One retention pass over recordings and logs. Returns per-target counts."""
+    recordings_deleted = (
+        cleanup_directory(os.path.join(OUTPUT_DIR, "videos"), RETENTION_DAYS, "*.mp4")
+        + cleanup_directory(os.path.join(OUTPUT_DIR, "detections"), RETENTION_DAYS, "*.jsonl")
+        # orphaned temp files from crashed runs, left flat in OUTPUT_DIR
+        + cleanup_directory(OUTPUT_DIR, RETENTION_DAYS, "txn_*.mp4")
+        + cleanup_directory(OUTPUT_DIR, RETENTION_DAYS, "txn_*.jsonl")
+    )
     return {
-        "recordings_deleted": cleanup_directory(OUTPUT_DIR, RETENTION_DAYS, "*.mp4"),
+        "recordings_deleted": recordings_deleted,
         "logs_deleted": cleanup_directory(TRANSACTION_LOG_DIR, LOG_RETENTION_DAYS, "*.json"),
     }
 

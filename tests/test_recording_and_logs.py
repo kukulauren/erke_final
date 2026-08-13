@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 import app.video_writer as video_writer
+from app.detection_logger import DetectionLogger
 from app.retail_analytics import RetailAnalytics
 from app.transaction_logger import log_transaction
 from calibrate import _percentile, collect_samples, suggest
@@ -49,6 +50,49 @@ class TestVideoWriter:
         w = video_writer.create_video_writer(path, 30, (321, 241))
         write_frames(w, size=(321, 241))
         assert os.path.getsize(path) > 0
+
+
+class TestDetectionLogger:
+
+    def test_log_frame_writes_expected_fields(self, tmp_path):
+        analytics = RetailAnalytics()
+        path = str(tmp_path / "clip.jsonl")
+        dlog = DetectionLogger(path)
+
+        detections = {
+            "cashier": [{"box": np.array([10.0, 20.0, 30.0, 40.0]), "conf": 0.91, "track_id": 3}],
+            "scanner": [{"box": np.array([1.0, 2.0, 3.0, 4.0]), "conf": 0.8, "track_id": 1}],
+            "customer": [],
+        }
+        dlog.log_frame(42, 4.2, detections, [(5.0, 6.0)], analytics)
+        dlog.close()
+
+        lines = open(path).read().strip().splitlines()
+        assert len(lines) == 1
+        rec = json.loads(lines[0])
+        assert rec["frame_idx"] == 42
+        assert rec["timestamp"] == 4.2
+        assert rec["wrists"] == [[5.0, 6.0]]
+
+        by_class = {d["class"]: d for d in rec["detections"]}
+        assert by_class["cashier"]["box"] == [10.0, 20.0, 30.0, 40.0]
+        assert by_class["cashier"]["track_id"] == 3
+        assert "label" in by_class["cashier"]  # has track_id -> analytics.get_person_label
+        assert "moving" in by_class["scanner"]  # scanner class -> scanner_moving flag
+        assert "label" not in by_class["scanner"]
+
+    def test_log_frame_no_track_id_skips_label(self, tmp_path):
+        analytics = RetailAnalytics()
+        path = str(tmp_path / "clip.jsonl")
+        dlog = DetectionLogger(path)
+        detections = {"item": [{"box": np.array([0.0, 0.0, 1.0, 1.0]), "conf": 0.5, "track_id": None}]}
+        dlog.log_frame(0, 0.0, detections, [], analytics)
+        dlog.close()
+
+        rec = json.loads(open(path).read().strip())
+        det = rec["detections"][0]
+        assert "label" not in det
+        assert det["track_id"] is None
 
 
 class TestTransactionLogger:

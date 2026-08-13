@@ -10,7 +10,8 @@ from typing import Dict, Tuple
 import cv2
 from ultralytics import YOLO
 
-from app.helper_functions import analytics_step, predict_frame, render_frame
+from app.detection_logger import DetectionLogger
+from app.helper_functions import analytics_step, predict_frame
 from app.pose_estimator import PoseEstimator
 from app.retail_analytics import RetailAnalytics
 from app.variables import (
@@ -78,6 +79,8 @@ class Prediction:
         self.frame = None
         self.out = None
         self.temp_video_path = None
+        self.detection_logger = None
+        self.temp_detections_path = None
         self.frame_count = 0
         self.frames_dropped = 0
         self.recording_enabled = False
@@ -149,21 +152,22 @@ class Prediction:
             try:
                 if output_dir:
                     os.makedirs(output_dir, exist_ok=True)
-                    self.temp_video_path = os.path.join(
-                        output_dir,
-                        f"txn_{int(time.time() * 1000)}.mp4"
-                    )
+                    stem = f"txn_{int(time.time() * 1000)}"
+                    self.temp_video_path = os.path.join(output_dir, f"{stem}.mp4")
+                    self.temp_detections_path = os.path.join(output_dir, f"{stem}.jsonl")
                 else:
                     import tempfile
                     tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
                     self.temp_video_path = tmp.name
                     tmp.close()
+                    self.temp_detections_path = os.path.splitext(self.temp_video_path)[0] + ".jsonl"
 
                 self.out = create_video_writer(
                     self.temp_video_path, self.source_fps, (self.width, self.height)
                 )
                 if self.out is None:
                     return False
+                self.detection_logger = DetectionLogger(self.temp_detections_path)
 
                 self.recording_enabled = True
                 self._recording_flushed.clear()  # Mark as "not yet flushed"
@@ -200,13 +204,29 @@ class Prediction:
         with self._lock:
             out = self.out
             self.out = None
+            detection_logger = self.detection_logger
+            self.detection_logger = None
             self.recording_enabled = False
         if out is not None:
             try:
                 out.release()
             except Exception as e:
                 logger.warning("Error releasing video writer: %s", e)
+        if detection_logger is not None:
+            try:
+                detection_logger.close()
+            except Exception as e:
+                logger.warning("Error closing detection logger: %s", e)
         self._recording_flushed.set()
+
+    def _move_recording_pair(self, video_dest, detections_dest):
+        """Move the temp video (and its detections sidecar, if any) to their
+        final videos/ and detections/ destinations."""
+        os.makedirs(os.path.dirname(video_dest), exist_ok=True)
+        os.replace(self.temp_video_path, video_dest)
+        if self.temp_detections_path and os.path.exists(self.temp_detections_path):
+            os.makedirs(os.path.dirname(detections_dest), exist_ok=True)
+            os.replace(self.temp_detections_path, detections_dest)
 
     def finalize_recording(self, voucher_number: str, output_dir: str) -> Tuple[bool, Dict]:
         """
@@ -241,10 +261,10 @@ class Prediction:
                 )
             else:
                 try:
-                    os.makedirs(output_dir, exist_ok=True)
                     safe_voucher = re.sub(r'[\\/:*?"<>|]', "_", voucher_number)
-                    output_path = os.path.join(output_dir, f"{safe_voucher}.mp4")
-                    os.replace(temp_path, output_path)
+                    output_path = os.path.join(output_dir, "videos", f"{safe_voucher}.mp4")
+                    detections_path = os.path.join(output_dir, "detections", f"{safe_voucher}.jsonl")
+                    self._move_recording_pair(output_path, detections_path)
                     video_saved = True
                     logger.info("Suspicious recording saved: %s", output_path)
                 except Exception as e:
@@ -261,22 +281,24 @@ class Prediction:
                 )
                 try:
                     if keep_for_training:
-                        train_dir = os.path.join(TRAINING_DATA_DIR, "clean")
-                        os.makedirs(train_dir, exist_ok=True)
                         safe_voucher = re.sub(r'[\\/:*?"<>|]', "_", voucher_number)
-                        train_path = os.path.join(
-                            train_dir, f"{safe_voucher}_{int(time.time())}.mp4"
-                        )
-                        os.replace(temp_path, train_path)
+                        stem = f"{safe_voucher}_{int(time.time())}"
+                        train_dir = os.path.join(TRAINING_DATA_DIR, "clean")
+                        train_path = os.path.join(train_dir, "videos", f"{stem}.mp4")
+                        train_detections_path = os.path.join(train_dir, "detections", f"{stem}.jsonl")
+                        self._move_recording_pair(train_path, train_detections_path)
                         debug["training_clip"] = train_path
                         logger.info("Clean clip kept for training: %s", train_path)
                     else:
                         os.remove(temp_path)
+                        if self.temp_detections_path and os.path.exists(self.temp_detections_path):
+                            os.remove(self.temp_detections_path)
                         logger.info("Non-suspicious temp recording deleted")
                 except Exception as e:
                     debug["error"] = f"Cleanup error: {e}"
 
         self.temp_video_path = None
+        self.temp_detections_path = None
         self.suspicious = False
         return video_saved, debug
 
@@ -386,10 +408,6 @@ class Prediction:
                         with self._lock:
                             analytics = self.analytics
                         events = analytics_step(analytics, detections, current_time, wrists)
-                        render_frame(
-                            frame, detections, analytics, events,
-                            current_time, self.width, self.height, wrists
-                        )
                         for event in events:
                             logger.info("[%.1fs] %s", current_time, event)
 
@@ -400,6 +418,11 @@ class Prediction:
                         if self.out is not None:
                             self.out.write(frame)
 
+                        if should_process and self.detection_logger is not None:
+                            self.detection_logger.log_frame(
+                                self.frame_count, current_time, detections, wrists, analytics
+                            )
+
                         if not self.recording_enabled and self.out is not None:
                             try:
                                 self.out.release()
@@ -407,6 +430,13 @@ class Prediction:
                                 logger.warning("Error releasing writer in worker: %s", e)
                             finally:
                                 self.out = None
+                            if self.detection_logger is not None:
+                                try:
+                                    self.detection_logger.close()
+                                except Exception as e:
+                                    logger.warning("Error closing detection logger in worker: %s", e)
+                                finally:
+                                    self.detection_logger = None
                             should_signal = True
 
                     if should_signal:
