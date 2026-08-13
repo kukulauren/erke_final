@@ -1,6 +1,9 @@
 # OS
 .DS_Store
 
+# Local secrets/config
+.env
+
 # Python
 __pycache__/
 *.pyc
